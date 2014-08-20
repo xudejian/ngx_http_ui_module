@@ -17,7 +17,8 @@ typedef struct {
 
 typedef struct {
     ngx_http_request_t        *request;
-    ngx_str_t                  key;
+    ngx_http_variable_value_t *callback;
+    int                        cb_jsonp_len;
 } ngx_http_ui_ctx_t;
 
 typedef struct {
@@ -29,6 +30,8 @@ typedef struct {
 static ngx_int_t ngx_http_ui_create_request(ngx_http_request_t *r);
 static ngx_int_t ngx_http_ui_reinit_request(ngx_http_request_t *r);
 static ngx_int_t ngx_http_ui_process_header(ngx_http_request_t *r);
+static ngx_int_t ngx_http_ui_filter_init(void *data);
+static ngx_int_t ngx_http_ui_filter(void *data, ssize_t bytes);
 static void ngx_http_ui_abort_request(ngx_http_request_t *r);
 static void ngx_http_ui_finalize_request(ngx_http_request_t *r,
     ngx_int_t rc);
@@ -136,6 +139,12 @@ ngx_module_t  ngx_http_ui_module = {
     NGX_MODULE_V1_PADDING
 };
 
+#define NGX_HTTP_UI_JSONP_BEGIN   (sizeof(ngx_http_ui_jsonp_begin) - 1)
+static u_char  ngx_http_ui_jsonp_begin[] = "/**/ typeof === 'function' && (";
+
+#define NGX_HTTP_UI_JSONP_END   (sizeof(ngx_http_ui_jsonp_end) - 1)
+static u_char  ngx_http_ui_jsonp_end[] = ");";
+
 
 static ngx_int_t
 ngx_http_ui_handler(ngx_http_request_t *r)
@@ -155,6 +164,7 @@ ngx_http_ui_handler(ngx_http_request_t *r)
         return rc;
     }
 
+    ngx_str_set(&r->headers_out.content_type, "application/javascript");
     if (ngx_http_set_content_type(r) != NGX_OK) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
@@ -177,7 +187,6 @@ ngx_http_ui_handler(ngx_http_request_t *r)
     u->process_header = ngx_http_ui_process_header;
     u->abort_request = ngx_http_ui_abort_request;
     u->finalize_request = ngx_http_ui_finalize_request;
-    r->state = 0;
 
     ctx = ngx_palloc(r->pool, sizeof(ngx_http_ui_ctx_t));
     if (ctx == NULL) {
@@ -185,8 +194,14 @@ ngx_http_ui_handler(ngx_http_request_t *r)
     }
 
     ctx->request = r;
+    ctx->callback = NULL;
+    ctx->cb_jsonp_len = 0;
 
     ngx_http_set_ctx(r, ctx, ngx_http_ui_module);
+
+    u->input_filter_init = ngx_http_ui_filter_init;
+    u->input_filter = ngx_http_ui_filter;
+    u->input_filter_ctx = ctx;
 
     r->main->count++;
 
@@ -227,6 +242,21 @@ get_slot_id(char *dst, int dlen, char *src, int len)
     return NGX_OK;
 }
 
+int get_valid_function_name_end(const u_char *str, int len) {
+  if (len < 1) {
+    return 0;
+  }
+  int i = 0;
+  for (i=0; i<len && *str; i++) {
+    if (isalnum(*str) || *str == '_' || *str == '.') {
+      str++;
+      continue;
+    }
+    return i;
+  }
+  return i;
+}
+
 static ngx_int_t
 ngx_http_ui_create_request(ngx_http_request_t *r)
 {
@@ -234,8 +264,10 @@ ngx_http_ui_create_request(ngx_http_request_t *r)
     ngx_buf_t                      *b;
     ngx_chain_t                    *cl;
     ui_params_t                    *ui_params;
-    /*ngx_http_ui_ctx_t              *ctx;*/
-    /*ngx_http_variable_value_t      *vv;*/
+    ngx_int_t                       key;
+    ngx_str_t                       var;
+    ngx_http_ui_ctx_t              *ctx;
+    ngx_http_variable_value_t      *vv;
     /*ngx_http_ui_loc_conf_t         *mlcf;*/
 
     /*mlcf = ngx_http_get_module_loc_conf(r, ngx_http_ui_module);*/
@@ -269,6 +301,20 @@ ngx_http_ui_create_request(ngx_http_request_t *r)
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "http ui request: slot \"%s\"", ui_params->slot_id);
 
+    ngx_str_set(&var, "arg_callback");
+    key = ngx_hash_key(var.data, var.len);
+    vv = ngx_http_get_variable(r, &var, key);
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_ui_module);
+    if (vv && !vv->not_found && vv->len) {
+      rv = get_valid_function_name_end(vv->data, vv->len);
+      if (rv > 0) {
+        vv->len = rv;
+      }
+      ctx->callback = vv;
+      ctx->cb_jsonp_len = NGX_HTTP_UI_JSONP_BEGIN + vv->len * 2 + NGX_HTTP_UI_JSONP_END;
+    }
+
     return NGX_OK;
 }
 
@@ -277,7 +323,7 @@ static ngx_int_t
 ngx_http_ui_reinit_request(ngx_http_request_t *r)
 {
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "http ui reinit request");
+                   "/////http ui reinit request");
 
     return NGX_OK;
 }
@@ -288,7 +334,9 @@ ngx_http_ui_process_header(ngx_http_request_t *r)
 {
     ngx_str_t                       line;
     ngx_http_upstream_t            *u;
+    ngx_http_ui_ctx_t              *ctx;
 
+    ctx = ngx_http_get_module_ctx(r, ngx_http_ui_module);
     u = r->upstream;
 
     line.data = u->buffer.pos;
@@ -305,17 +353,131 @@ ngx_http_ui_process_header(ngx_http_request_t *r)
       return NGX_HTTP_UPSTREAM_INVALID_HEADER;
     }
 
-    if (u->headers_in.content_length_n < 2) {
-      u->headers_in.status_n = 204;
-      u->state->status = 204;
+    /*if (u->headers_in.content_length_n < 3) {*/
+      /*u->headers_in.status_n = NGX_HTTP_NO_CONTENT;*/
+      /*u->state->status = NGX_HTTP_NO_CONTENT;*/
+      /*u->keepalive = 1;*/
+
+      /*return NGX_OK;*/
+    /*}*/
+
+    u->headers_in.content_length_n += ctx->cb_jsonp_len;
+    u->headers_in.status_n = 200;
+    u->state->status = 200;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_ui_filter_init(void *data)
+{
+    ngx_http_ui_ctx_t  *ctx = data;
+
+    ngx_http_upstream_t  *u;
+
+    u = ctx->request->upstream;
+
+    if (u->headers_in.status_n != 404) {
+        u->length = u->headers_in.content_length_n;
+
+    } else {
+        u->length = 0;
+    }
+
+    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, ctx->request->connection->log, 0,
+                   "//////ui filter length:%z %d %d",
+                   u->length, u->headers_in.content_length_n, ctx->cb_jsonp_len);
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_ui_filter(void *data, ssize_t bytes)
+{
+    ngx_http_ui_ctx_t  *ctx = data;
+
+    ngx_buf_t            *b;
+    ngx_str_t             cb;
+    ngx_chain_t          *cl, **ll;
+    ngx_http_upstream_t  *u;
+
+    u = ctx->request->upstream;
+    b = &u->buffer;
+
+    ngx_log_debug4(NGX_LOG_DEBUG_HTTP, ctx->request->connection->log, 0,
+                   "//////ui filter length:%z %d %d bytes:%z",
+                   u->length, u->headers_in.content_length_n,
+                   ctx->cb_jsonp_len, bytes);
+    if (u->length == 0) {
       u->keepalive = 1;
+      return NGX_OK;
+    }
+
+    for (cl = u->out_bufs, ll = &u->out_bufs; cl; cl = cl->next) {
+        ll = &cl->next;
+    }
+
+    cl = ngx_chain_get_free_buf(ctx->request->pool, &u->free_bufs);
+    if (cl == NULL) {
+        return NGX_ERROR;
+    }
+
+    cl->buf->flush = 1;
+    cl->buf->memory = 1;
+    cl->buf->last_buf = 1;
+    cl->next = NULL;
+
+    *ll = cl;
+
+    cl->buf->pos = b->last;
+    b->last += bytes;
+
+    if (ctx->callback) {
+      b->last = ngx_copy(b->last, ngx_http_ui_jsonp_end, NGX_HTTP_UI_JSONP_END);
+    }
+
+    cl->buf->last = b->last;
+    cl->buf->tag = u->output.tag;
+
+    if (!ctx->callback) {
+      u->length = 0;
+      u->keepalive = 1;
+      ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ctx->request->connection->log, 0,
+                     "ui filter bytes:%z size:%z",
+                     bytes, b->last - b->pos);
 
       return NGX_OK;
     }
 
-    u->headers_in.status_n = 200;
-    u->state->status = 200;
+    cl = ngx_chain_get_free_buf(ctx->request->pool, &u->free_bufs);
+    if (cl == NULL) {
+        return NGX_ERROR;
+    }
+
+    cl->buf->flush = 1;
+    cl->buf->memory = 1;
+    cl->buf->last_buf = 0;
+
+    cl->buf->pos = b->last;
+    ngx_str_set(&cb, "/**/ typeof ");
+    b->last = ngx_copy(b->last, cb.data, cb.len);
+    b->last = ngx_copy(b->last, ctx->callback->data, ctx->callback->len);
+    ngx_str_set(&cb, " === 'function' && ");
+    b->last = ngx_copy(b->last, cb.data, cb.len);
+    b->last = ngx_copy(b->last, ctx->callback->data, ctx->callback->len);
+    *b->last++ = '(';
+    cl->buf->last = b->last;
+    cl->buf->tag = u->output.tag;
+
+    cl->next = u->out_bufs;
+    u->out_bufs = cl;
+
+    u->length = 0;
     u->keepalive = 1;
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ctx->request->connection->log, 0,
+                   "ui filter bytes:%z size:%z",
+                   bytes, b->last - b->pos);
 
     return NGX_OK;
 }
