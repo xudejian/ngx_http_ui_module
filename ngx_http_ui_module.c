@@ -23,7 +23,11 @@ typedef struct {
 
 typedef struct {
   int magic;
-  char slot_id[12];
+  char query[12];
+  long int slot_id;
+  unsigned int ip;
+	char need_merge;
+	char need_pb;
 } ui_params_t;
 
 
@@ -210,11 +214,10 @@ ngx_http_ui_handler(ngx_http_request_t *r)
     return NGX_DONE;
 }
 
-static int
-get_slot_id(char *dst, int dlen, char *src, int len)
+static long int
+get_slot_id(char *src, int len)
 {
     char *p, *pend;
-    dlen--;
     pend = src + len;
     if (*(pend-1) == '/') {
       pend--;
@@ -222,7 +225,7 @@ get_slot_id(char *dst, int dlen, char *src, int len)
 
     p = pend - 1;
     if (*p < '0' || *p > '9') {
-        return NGX_ERROR;
+        return 0;
     }
 
     while(*p && *p >= '0' && *p <= '9' ) {
@@ -231,15 +234,9 @@ get_slot_id(char *dst, int dlen, char *src, int len)
     p++;
 
     if (p == pend) {
-        return NGX_ERROR;
+        return 0;
     }
-    len = pend - p;
-    if (len > dlen) {
-      len = dlen;
-    }
-    strncpy(dst, p, len);
-    dst[len] = '\0';
-    return NGX_OK;
+    return atol(p);
 }
 
 int get_valid_function_name_end(const u_char *str, int len) {
@@ -290,22 +287,34 @@ ngx_http_ui_create_request(ngx_http_request_t *r)
     b->last = b->pos + sizeof(ui_params_t);
     ui_params = (ui_params_t *) b->pos;
     ui_params->magic = sizeof(ui_params_t);
-    rv = get_slot_id(ui_params->slot_id, sizeof(ui_params->slot_id),
-        (char*)r->uri.data, r->uri.len);
-    if (rv == NGX_ERROR) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "get \"slot_id\" fail");
-        return NGX_ERROR;
-    }
+    ui_params->slot_id = get_slot_id((char*)r->uri.data, r->uri.len);
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "http ui request: slot \"%s\"", ui_params->slot_id);
+                   "http ui request: slot \"%ld\"", ui_params->slot_id);
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_ui_module);
+
+    ngx_str_set(&var, "arg_q");
+    key = ngx_hash_key(var.data, var.len);
+    vv = ngx_http_get_variable(r, &var, key);
+
+    if (vv && !vv->not_found && vv->len) {
+      rv = sizeof(ui_params->query) - 1;
+      if (rv > vv->len) {
+        rv = vv->len;
+      }
+      memcpy(ui_params->query, vv->data, rv);
+      ui_params->query[rv] = '\0';
+    }
+
+    if (ui_params->slot_id < 1 && !ui_params->query[0]) {
+      return NGX_ERROR;
+    }
 
     ngx_str_set(&var, "arg_callback");
     key = ngx_hash_key(var.data, var.len);
     vv = ngx_http_get_variable(r, &var, key);
 
-    ctx = ngx_http_get_module_ctx(r, ngx_http_ui_module);
     if (vv && !vv->not_found && vv->len) {
       rv = get_valid_function_name_end(vv->data, vv->len);
       if (rv > 0) {
