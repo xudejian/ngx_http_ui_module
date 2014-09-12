@@ -23,7 +23,7 @@ typedef struct {
 
 typedef struct {
   int magic;
-  char query[12];
+  char query[128];
   long int slot_id;
   unsigned int ip;
 	char need_merge;
@@ -265,6 +265,7 @@ ngx_http_ui_create_request(ngx_http_request_t *r)
     ngx_str_t                       var;
     ngx_http_ui_ctx_t              *ctx;
     ngx_http_variable_value_t      *vv;
+    u_char                         *dst, *src;
     /*ngx_http_ui_loc_conf_t         *mlcf;*/
 
     /*mlcf = ngx_http_get_module_loc_conf(r, ngx_http_ui_module);*/
@@ -298,8 +299,15 @@ ngx_http_ui_create_request(ngx_http_request_t *r)
     key = ngx_hash_key(var.data, var.len);
     vv = ngx_http_get_variable(r, &var, key);
 
+    ui_params->query[0] = '\0';
     if (vv && !vv->not_found && vv->len) {
+      dst = vv->data;
+      src = vv->data;
+
+      ngx_unescape_uri(&dst, &src, vv->len, NGX_UNESCAPE_URI);
+      vv->len = dst - vv->data;
       rv = sizeof(ui_params->query) - 1;
+
       if (rv > vv->len) {
         rv = vv->len;
       }
@@ -310,6 +318,19 @@ ngx_http_ui_create_request(ngx_http_request_t *r)
     if (ui_params->slot_id < 1 && !ui_params->query[0]) {
       return NGX_ERROR;
     }
+
+#define get_arg_int(name, item, def)                                          \
+    do {                                                                      \
+      ngx_str_set(&var, "arg_" name);                                         \
+      key = ngx_hash_key(var.data, var.len);                                  \
+      vv = ngx_http_get_variable(r, &var, key);                               \
+      ui_params->item = def;                                                  \
+      if (vv && !vv->not_found && vv->len) {                                  \
+        ui_params->item = atoi(vv->data);                                     \
+      }                                                                       \
+    } while (0)
+
+#undef get_arg_int
 
     ngx_str_set(&var, "arg_callback");
     key = ngx_hash_key(var.data, var.len);
