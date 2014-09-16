@@ -143,8 +143,7 @@ ngx_module_t  ngx_http_ui_module = {
     NGX_MODULE_V1_PADDING
 };
 
-#define NGX_HTTP_UI_JSONP_BEGIN   (sizeof(ngx_http_ui_jsonp_begin) - 1)
-static u_char  ngx_http_ui_jsonp_begin[] = "/**/ typeof === 'function' && (";
+#define NGX_HTTP_UI_JSONP_BEGIN   (sizeof("/**/ typeof === 'function' && (") - 1)
 
 #define NGX_HTTP_UI_JSONP_END   (sizeof(ngx_http_ui_jsonp_end) - 1)
 static u_char  ngx_http_ui_jsonp_end[] = ");";
